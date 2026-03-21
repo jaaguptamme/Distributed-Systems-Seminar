@@ -1,6 +1,7 @@
 from mpi4py import MPI
 import argparse
 import random
+from time import time
 
 TAG = 1009
 
@@ -529,6 +530,7 @@ def main():
         raise SystemExit("Need >=2 ranks")
 
     if rank == 0:
+        start=time()
         server(
             comm,
             size,
@@ -541,11 +543,13 @@ def main():
             args.window,
             args.validate_inserts,
         )
+        print("Time: ",time()-start)
     else:
         processor(comm, rank, args.B)
 
 
 if __name__ == "__main__":
     main()
+
 
 
