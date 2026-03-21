@@ -2,6 +2,7 @@ from mpi4py import MPI
 import argparse
 import random
 from collections import defaultdict
+from time import time
 
 TAG = 1201
 
@@ -498,11 +499,14 @@ def main():
     size = comm.size
 
     if rank == 0:
+        start=time()
         server(comm, size, args.inserts, args.key_range, args.seed, args.B, args.window, args.random, args.validate_inserts)
+        print("Time: ",time()-start)
     else:
         processor(comm, rank, args.B)
 
 
 if __name__ == "__main__":
     main()
+
 
