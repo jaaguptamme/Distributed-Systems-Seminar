@@ -1,6 +1,7 @@
 import argparse, bisect, random
 from collections import deque
 from mpi4py import MPI
+from time import time
 
 INS, INS_BATCH, DEL, FIND, READ, PREP, COMM, ABRT, STOP = "INS", "INS_BATCH", "DEL", "FIND", "READ", "PREP", "COMM", "ABRT", "STOP"  # message types
 OK, REDIR, SPLIT, MERGE, YES, NO, ACK, FOUND = "OK", "REDIR", "SPLIT", "MERGE", "YES", "NO", "ACK", "FOUND"  # response types
@@ -887,6 +888,7 @@ def main():
         raise SystemExit("--window must be >= 0")
 
     if rank == 0:
+        start=time()
         rng = random.Random(args.seed)
         coordinator = Coordinator(comm, args.log, args.leaf_capacity)
         inserted_keys = []
@@ -927,11 +929,13 @@ def main():
             f"internal_nodes={coordinator.internal_node_count()} root_children={coordinator.root_children()} index_height={coordinator.index_height()} fanout={coordinator.index_fanout}"
         )
         coordinator.stop()
+        print("Time: ",time()-start)
     else:
         Server(rank, comm, args.leaf_capacity).loop()
 
 
 if __name__ == "__main__":
     main()
+
 
 
