@@ -12,6 +12,9 @@ OP_SET_ROOT = "set_root"
 OP_INS = "insert_bottomup"
 OP_INS_REPLY = "insert_reply"
 
+OP_FIND = "find_key"
+OP_FIND_REPLY = "find_reply"
+
 OP_DEL = "delete_key"
 OP_DEL_REPLY = "delete_reply"
 
@@ -196,6 +199,7 @@ def processor(comm, rank, B):
     root_id = None
 
     pending_insert = {}
+    pending_find = {}
     pending_delete = {}
 
     while True:
@@ -339,6 +343,66 @@ def processor(comm, rank, B):
             )
             continue
 
+        if op == OP_FIND:
+            op_id = msg["op_id"]
+            k = msg["key"]
+            nid = msg["node_id"]
+            reply_to = msg["reply_to"]
+
+            nid = store.move_right_for_key(nid, k)
+            n = store.nodes[nid]
+
+            if n.is_leaf:
+                i = lower_bound(n.keys, k)
+                found = i < len(n.keys) and n.keys[i] == k
+                comm.send(
+                    {
+                        "op": OP_FIND_REPLY,
+                        "op_id": op_id,
+                        "found": found,
+                    },
+                    dest=reply_to,
+                    tag=TAG,
+                )
+                continue
+
+            actual_node, child = store.choose_child(nid, k)
+            pending_find[op_id] = {
+                "reply_to": reply_to,
+                "node_id": actual_node,
+                "child_id": child,
+            }
+
+            comm.send(
+                {
+                    "op": OP_FIND,
+                    "op_id": op_id,
+                    "key": k,
+                    "node_id": child,
+                    "reply_to": rank,
+                },
+                dest=rank - 1,
+                tag=TAG,
+            )
+            continue
+
+        if op == OP_FIND_REPLY:
+            op_id = msg["op_id"]
+            if op_id not in pending_find:
+                raise RuntimeError(f"Missing pending find context for op_id={op_id} on rank={rank}")
+
+            ctx = pending_find.pop(op_id)
+            comm.send(
+                {
+                    "op": OP_FIND_REPLY,
+                    "op_id": op_id,
+                    "found": msg["found"],
+                },
+                dest=ctx["reply_to"],
+                tag=TAG,
+            )
+            continue
+
         if op == OP_DEL:
             op_id = msg["op_id"]
             k = msg["key"]
@@ -439,6 +503,48 @@ def run_insert_phase(comm, root_rank, root_id, keys, window):
     return inserted
 
 
+def validate_inserts(comm, root_rank, root_id, inserted, window):
+    unique_keys = sorted(set(inserted))
+    next_op_id = 1
+    next_key_index = 0
+    outstanding = 0
+    pending_keys = {}
+    found = 0
+    missing = []
+
+    while next_key_index < len(unique_keys) or outstanding > 0:
+        while next_key_index < len(unique_keys) and outstanding < window:
+            k = unique_keys[next_key_index]
+            pending_keys[next_op_id] = k
+            comm.send(
+                {
+                    "op": OP_FIND,
+                    "op_id": next_op_id,
+                    "key": k,
+                    "node_id": root_id,
+                    "reply_to": 0,
+                },
+                dest=root_rank,
+                tag=TAG,
+            )
+            next_key_index += 1
+            next_op_id += 1
+            outstanding += 1
+
+        rep = comm.recv(source=root_rank, tag=TAG)
+        if rep["op"] != OP_FIND_REPLY:
+            raise RuntimeError(f"Unexpected message at server during validation phase: {rep}")
+
+        check_key = pending_keys.pop(rep["op_id"])
+        if rep["found"]:
+            found += 1
+        else:
+            missing.append(check_key)
+        outstanding -= 1
+
+    return unique_keys, found, missing
+
+
 def run_delete_phase(comm, root_rank, root_id, delete_keys, window):
     next_op_id = 1
     next_key_index = 0
@@ -487,7 +593,13 @@ def server(comm, size, B, inserts, deletes, key_range, use_random, seed, window,
     inserted = run_insert_phase(comm, root_rank, root_id, keys, window)
 
     if validate:
-        print("[rank0] validate-inserts skipped (not implemented in bottomupParallel.py)")
+        unique_keys, found, missing = validate_inserts(comm, root_rank, root_id, inserted, window)
+        print(f"[rank0] validate-inserts unique={len(unique_keys)} found={found} missing={len(missing)}")
+        if missing:
+            print(f"[rank0] first missing keys: {missing[:10]}")
+            print("[rank0] insert validation FAILED")
+        else:
+            print("[rank0] insert validation OK")
 
     delete_count = min(deletes, len(inserted))
     delete_keys = inserted[:delete_count]
@@ -543,13 +655,14 @@ def main():
             args.window,
             args.validate_inserts,
         )
-        print("Time: ",time()-start)
+        print("Time: ",round(time()-start,2))
     else:
         processor(comm, rank, args.B)
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
