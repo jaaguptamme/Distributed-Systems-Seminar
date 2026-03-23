@@ -3,6 +3,8 @@ from collections import deque
 from mpi4py import MPI
 from time import time
 
+# This implementation follows the "distributed transactions / minitransactions" paper.
+# Structural changes are coordinated through PREP/COMM/ABRT instead of ad hoc lock coupling.
 INS, INS_BATCH, DEL, FIND, READ, PREP, COMM, ABRT, STOP = "INS", "INS_BATCH", "DEL", "FIND", "READ", "PREP", "COMM", "ABRT", "STOP"  # message types
 OK, REDIR, SPLIT, MERGE, YES, NO, ACK, FOUND = "OK", "REDIR", "SPLIT", "MERGE", "YES", "NO", "ACK", "FOUND"  # response types
 OP_TAG, CTRL_TAG = 1, 2  # separate data-path ops from control/transaction traffic
@@ -20,6 +22,8 @@ class Leaf:
         self.keys = keys or []  # keys stored in leaf
         self.values = values or []  # values stored in leaf
         self.version = version  # page version
+        # Version + short-lived lock model the paper's optimistic transaction validation.
+        # Pages are checked in prepare, then updated atomically in commit.
         self.lock = lock  # transaction holding lock
 
 
@@ -80,6 +84,8 @@ class Server:
             leaf.keys.pop(delete_index)
             leaf.values.pop(delete_index)
 
+    # Important distribution decision from paper [1]: when a page overflows, compute the split locally,
+    # but do not mutate it yet. Return a transaction plan so rank 0 can atomically update all affected servers.
     def split_plan(self, leaf, num_servers):
         middle = len(leaf.keys) // 2
         left_keys, right_keys = leaf.keys[:middle], leaf.keys[middle:]
@@ -131,6 +137,9 @@ class Server:
             },
         }
 
+    # Prepare phase of the two-phase commit.
+    # This is the main difference from the other two codes: correctness here relies on validating
+    # expected versions and locking touched pages only for commit duration, not on background repair.
     def prepare(self, transaction_id, operations):
         locked_pages = []
         for operation in sorted(operations, key=lambda item: item["pid"]):
@@ -158,6 +167,8 @@ class Server:
         self.staged_transactions[transaction_id] = operations
         return {"k": YES}
 
+    # Commit phase: after all participants vote YES, apply the staged writes atomically.
+    # This mirrors Sinfonia-style minitransactions used to make node splits less error-prone.
     def commit(self, transaction_id):
         operations = self.staged_transactions.pop(transaction_id, [])
         for operation in operations:
@@ -262,6 +273,9 @@ class Server:
                 insert_index = bisect.bisect_left(leaf.keys, key)
                 key_exists = insert_index < len(leaf.keys) and leaf.keys[insert_index] == key
 
+                # Key algorithmic choice versus bottom-up/top-down tree-only variants:
+                # do not modify the leaf first and then repair structure.
+                # Instead, return a split plan so the coordinator can commit the whole structural change transactionally.
                 # Predictive split: if a new key would overflow the leaf, do not mutate the page first.
                 # Let rank0 commit the split transaction, then retry the insert against the updated route.
                 if not key_exists and len(leaf.keys) >= self.leaf_capacity:
@@ -296,6 +310,9 @@ class Coordinator:
         self.world_size = comm.Get_size()  # total process count
         self.transaction_id = 1000  # next transaction id
         self.next_page_id = {rank: 1_000_000_000 for rank in range(1, self.world_size)}  # page ids by rank
+        # Coordinator-side replicated routing metadata.
+        # This reflects the paper's idea that upper-level navigation info / versions are replicated
+        # to prevent the root and top of the tree from becoming the bottleneck.
         self.route_index = [(10**18, 1, 1)]  # sorted leaf directory: (high_key, rank, page_id)
         self.index_fanout = max(8, min(leaf_capacity, 64))  # coordinator-side internal-node fanout
         self.index_root = None  # coordinator-side B+-tree internal nodes over route_index
@@ -387,6 +404,9 @@ class Coordinator:
         bisect.insort(self.route_index, (merged_high, merged_rank, merged_pid))
         self.rebuild_index_tree()
 
+    # Execute one distributed minitransaction across all touched ranks.
+    # Compared with the other two implementations, concurrency control is explicit here:
+    # first validate/prepare everywhere, then commit everywhere.
     def txn(self, operations_by_rank):
         self.transaction_id += 1
         current_tid = self.transaction_id
@@ -405,6 +425,8 @@ class Coordinator:
         self.tx_commits += 1
         return True
 
+    # The server may answer with REDIR (routing was stale) or SPLIT (a transactional structural update is needed).
+    # Rank 0 then decides whether to retry, redirect, or commit a split transaction.
     def _handle_insert_result(self, state, result):
         if result["k"] == OK:
             return True
@@ -908,6 +930,8 @@ def main():
             delete_keys.append(inserted_keys[rng.randrange(len(inserted_keys))])
         coordinator.delete_many(delete_keys, window=window)
 
+        # Final validation checks that all keys that should remain are actually reachable after
+        # transactional splits / deletes. This is a simple end-to-end sanity check on the minitransaction logic.
         if args.validate_inserts:
             remaining = sorted(set(inserted_keys) - set(delete_keys))
             present = coordinator.collect_all_keys()
@@ -929,7 +953,7 @@ def main():
             f"internal_nodes={coordinator.internal_node_count()} root_children={coordinator.root_children()} index_height={coordinator.index_height()} fanout={coordinator.index_fanout}"
         )
         coordinator.stop()
-        print("Time: ",time()-start)
+        print("Time: ",round(time()-start,2))
     else:
         Server(rank, comm, args.leaf_capacity).loop()
 
