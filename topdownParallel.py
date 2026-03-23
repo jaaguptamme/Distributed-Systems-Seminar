@@ -48,6 +48,8 @@ class Node:
         self.children = children
         self.left = None
         self.right = None
+        # Even though this is the top-down version, sibling links are still kept.
+        # They act as a safety net if routing briefly points to a neighboring node.
         self.high_key = None  # None => open-ended rightmost sibling
 
 
@@ -174,6 +176,9 @@ class LevelStore:
         self.update_internal_high_key(rid)
         return sep, rid
 
+    # Top-down policy difference:
+    # split a full child before descending into it.
+    # This avoids upward split propagation during the actual insert step.
     def is_full_for_topdown(self, nid):
         n = self.nodes[nid]
         if n.is_leaf:
@@ -195,6 +200,8 @@ def init_fixed_height_tree(comm, size):
 
 
 
+# Install a child split in the parent as soon as the notification arrives.
+# If the expected left child is not visible yet, keep the update as an orphan and retry later.
 def apply_split_install(store, nid, rep, orphans, rank):
     n = store.nodes[nid]
     left_id = rep["left_child_id"]
@@ -285,6 +292,9 @@ def processor(comm, rank, B):
             nid = store.chase_right(nid, k)
             n = store.nodes[nid]
 
+            # Article-specific top-down choice: transform the current node before going deeper.
+            # This is the opposite of the bottom-up variant, where overflow is first handled at the leaf
+            # and only then propagated upward in the background / by return messages.
             if store.is_full_for_topdown(nid):
                 if rank == root_rank:
                     raise RuntimeError("Top fixed root overflowed. Increase MPI ranks or B.")
@@ -295,6 +305,8 @@ def processor(comm, rank, B):
                     sep, rid = store.split_internal(nid)
                     log(rank, f"INTERNAL SPLIT at node={nid} -> right={rid}, split_key={sep}, op_id={op_id}", "splits")
 
+                # After splitting locally, notify the parent immediately so the separator is installed
+                # before the insert continues downward. This is the main "top-down" structural discipline.
                 comm.send(
                     {
                         "op": OP_SPLIT_NOTIFY,
@@ -409,6 +421,9 @@ def run_insert_phase(comm, root_rank, root_id, keys, window):
 
 
 
+# Validation is done with ordinary searches.
+# In the top-down algorithm this is especially important because the paper's goal is that
+# searches remain simple, almost like in a serial B-tree, despite parallel splits.
 def validate_inserts(comm, root_rank, root_id, inserted, window):
     unique_keys = sorted(set(inserted))
     next_op_id = 1
@@ -501,12 +516,13 @@ def main():
     if rank == 0:
         start=time()
         server(comm, size, args.inserts, args.key_range, args.seed, args.B, args.window, args.random, args.validate_inserts)
-        print("Time: ",time()-start)
+        print("Time: ",round(time()-start,2))
     else:
         processor(comm, rank, args.B)
 
 
 if __name__ == "__main__":
     main()
+
 
 
