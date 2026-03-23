@@ -49,6 +49,8 @@ class Node:
         self.values = values
         self.children = children
         self.right = None # right sibling on the same rank
+        # Bottom-up / B-link style choice: sibling links are essential here.
+        # They let searches and updates recover by moving right if an upper-level pointer is stale.
         self.high_key = None  # exclusive upper bound; None means +inf
 
 
@@ -72,6 +74,9 @@ class LevelStore:
         self.nodes[nid] = Node(False, [], None, [])
         return nid
 
+    # Key bottom-up difference from the top-down variant:
+    # if parent-side routing is temporarily stale after a split, follow right-sibling links
+    # until a node whose cover/high_key matches the search key is found.
     def move_right_for_key(self, nid, k):
         while True:
             n = self.nodes[nid]
@@ -131,7 +136,9 @@ class LevelStore:
 
         split_key = r.keys[0]
 
-        # B-link maintenance: left keeps old upper bound only up to split_key.
+        # Core bottom-up decision: perform the local leaf split first and repair upper levels later.
+        # B-link maintenance keeps the structure searchable immediately even before propagation finishes.
+        # The left node now covers keys < split_key, while the new right sibling covers the rest.
         r.right = n.right
         r.high_key = n.high_key
         n.right = rid
@@ -139,6 +146,8 @@ class LevelStore:
 
         return split_key, rid
 
+    # Same idea for internal nodes: split locally on this level first,
+    # keep right links/high keys valid, and let the split information propagate upward via replies.
     def split_internal_if_needed(self, nid):
         n = self.nodes[nid]
 
@@ -293,7 +302,8 @@ def processor(comm, rank, B):
             child_id = ctx["child_id"]
             reply_to = ctx["reply_to"]
 
-            # The parent itself may have shifted right because of an earlier split.
+            # Bottom-up subtlety: while this reply was in flight, the parent may itself have split.
+            # So we may need to chase right before installing the child split.
             n_actual = store.nodes[nid]
             if n_actual.high_key is not None and msg["split_key"] is not None and msg["split_key"] >= n_actual.high_key and n_actual.right is not None:
                 nid = store.move_right_for_key(nid, msg["split_key"])
@@ -303,7 +313,8 @@ def processor(comm, rank, B):
             actual_child = msg.get("child_id", child_id)
 
             if rid is not None:
-                # The original child may have moved to the right if parent split before this reply was handled.
+                # Another bottom-up recovery case: the child separator may now belong under a right sibling
+                # of the original parent, so search right until the referenced child is found.
                 parent = store.nodes[nid]
                 if actual_child not in parent.children:
                     probe = nid
@@ -503,6 +514,9 @@ def run_insert_phase(comm, root_rank, root_id, keys, window):
     return inserted
 
 
+# Validation is intentionally implemented as plain finds after the insert phase.
+# This mirrors the article's requirement that searches must still succeed even while structural
+# updates/split propagation may have happened concurrently.
 def validate_inserts(comm, root_rank, root_id, inserted, window):
     unique_keys = sorted(set(inserted))
     next_op_id = 1
